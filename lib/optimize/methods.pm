@@ -6,6 +6,7 @@ use warnings FATAL => 'all';
 
 use Exporter;
 our @ISA = 'Exporter';
+our @EXPORT = our @EXPORT_OK = qw(finalize_class);
 
 =head1 NAME
 
@@ -32,6 +33,9 @@ sub import {
     my $caller = shift || caller;
     
     optimize_methods($caller);
+    
+    unshift @_, $self;
+    goto &{$self->can("SUPER::import")};
 }
 
 sub unimport {
@@ -41,7 +45,7 @@ sub unimport {
 }
 
 my %finalized;
-sub UNIVERSAL::finalize_class {
+sub finalize_class {
     my $class = shift;
     
     optimize_methods($class);
@@ -51,16 +55,17 @@ sub UNIVERSAL::finalize_class {
         shift @$caller_isa; # Remove this class
         
         for my $class ( @$caller_isa ) {
-            $class->finalize_class unless $finalized{$class}++;
+            finalize_class($class) unless $finalized{$class}++;
         }
     }
     
     my $stash = do { no strict; \%{"${class}::"} };
     for my $entry (keys %$stash) {
         next if $entry eq 'finalize_class';
+        next if ref(\$stash->{$entry}) ne 'GLOB';
         my $cv = *{$stash->{$entry}}{CODE};
         next unless $cv;
-        optimize::methods::traverse_function($cv);
+        traverse_function($cv);
     }
     $finalized{$class}++;
 }

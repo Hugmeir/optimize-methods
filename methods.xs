@@ -84,13 +84,20 @@ optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
         /* Get the method name from the method_named op */
         method = cSVOPx_sv(aop);
         gv   = gv_fetchmethod_sv_flags(stash, method, 0);
-        if ( gv && isGV(gv) && (cv = GvCV(gv)) ) {
+        if ( gv && isGV(gv) && (cv = GvCV(gv))
+            /* Find out why these two are necessary! */
+            && !CvANON(cv) && !SvMAGIC((SV*)cv) ) {
             /* We MUST use CvGV(cv) here, NOT gv. This is because
              * the GV might be Doof::bar, but the CV actually resides
              * in Foo::bar; CvGV(cv) will give us the right location.
              */
+             
+             /* XXX this is likely broken, or at least it doesn't mesh well
+              * with optimize::subs
+              */
             OP * new_op     = newGVOP(OP_GV, 0, CvGV(cv));
             new_op->op_next = entersubop;
+            
             /* This can be catastrophic if dealing
              * with threads; the op may change while a
              * sub is running
@@ -100,6 +107,11 @@ optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
             op_null(aop);
             aop->op_sibling = aop->op_next;
             OP_REFCNT_UNLOCK;
+
+            /* Finally, since the classname is now an argument, it's subject
+             * to strict checking, so turn it off for this bareword
+             */
+            classname_op->op_private &= ~(OPpCONST_BARE|OPpCONST_STRICT);
         }
     }
 }
