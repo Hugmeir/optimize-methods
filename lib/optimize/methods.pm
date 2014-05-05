@@ -153,6 +153,38 @@ B<everywhere>.  This means that you can get some speed gains from some modules
 that were not written to account for this, like File::Spec or the pragmas,
 but you open yourself to demons.
 
+=head1 LIMITATIONS
+
+Oh boy.
+
+=over 4
+
+=item * Code within BEGIN {} blocks will likely not be optimized
+
+An example might be warranted; let's take the semi-usual case of unrolling
+'use Foo;':
+
+    BEGIN {
+        require Foo;
+        Foo->import();
+    }
+
+In this case, while the code block is being run during the compilation
+phase, the require itself happens at the runtime of the BEGIN block,
+which means that Foo.pm won't be loaded in time for us to check wether
+Foo->import actually exists.
+
+You could force the optimization to kick in my writing code likely
+
+    BEGIN { require Foo; }
+    BEGIN { Foo->import; }
+
+But that is likely unnecessary; BEGIN blocks are only run once, so
+the optimization not kicking in is no big loss.
+
+=back
+
+
 =head1 AUTHOR
 
 Brian Fraser, C<< <brian.fraser at booking.com> >>
