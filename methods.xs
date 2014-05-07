@@ -51,7 +51,6 @@ THX_method_named_find_stash(pTHX_ OP *classname_op, AV * const comppad_name, SV 
         /* Disallow ""->doof() */
         if ( !*class_sv || !*(SvPV(*class_sv, len)) || len == 0 )
             return NULL;
-        /* I am unsure regarding this GV_ADD */
         stash = gv_stashsv(*class_sv, 0);
         return stash;
     }
@@ -122,14 +121,16 @@ THX_pessimize(pTHX_ OP* entersubop)
     method_named->op_sibling = opgv->op_sibling;
     method_named->op_next    = opgv->op_next;
     
+    entersubop->op_spare  = 0;
     prev->op_sibling = method_named;
+    entersubop->op_ppaddr = default_entersub;
     
     op_free(nullop);
     /* XXX ...huh. Crashes Moose. Investigate? */
-    //op_free(opgv);
+    /*opgv->op_sibling = NULL;
+      opgv->op_next    = NULL;
+      op_free(opgv);*/
 
-    entersubop->op_spare  = 0;
-    entersubop->op_ppaddr = default_entersub;
     
     PL_op = method_named;
 
@@ -147,9 +148,8 @@ om_entersub_method_named(pTHX) {
     {
         OP * entersubop = PL_op;
         SV * obj_sv = *(PL_stack_base + TOPMARK + 1);
-        SV * ob;
         if ( entersubop->op_spare == 0 ) {
-            SV * classname_sv;
+            SV *newsv;
             OP * aop = cUNOPx(entersubop)->op_first;
 
             SvGETMAGIC(obj_sv);
@@ -159,16 +159,19 @@ om_entersub_method_named(pTHX) {
                     PL_op->op_ppaddr = default_entersub;
                     return default_entersub(aTHX);
                 }
-                classname_sv = newSVsv(obj_sv);
+                /* $x = "Foo"; $x->bar */
+                newsv = newSVsv(obj_sv);
+                (void)SvUPGRADE(newsv, SVt_PVNV);
+                SvIV_set(newsv, 0);
+                SvIOK_on(newsv);
             }
             else {
-                ob = SvRV(obj_sv);
-                if (!SvSTASH(ob)) {
-                    /* huh? */
-                    op_dump(entersubop);
-                    croak("weirdness!^^^");
-                }
-                classname_sv = newSVhek(HvNAME_HEK(ob));
+                SV * ob    = SvRV(obj_sv);
+                HV * stash = SvSTASH(ob);
+                newsv = newSVhek(HvNAME_HEK(stash));
+                (void)SvUPGRADE(newsv, SVt_PVNV);
+                SvIV_set(newsv, PTR2IV(stash));
+                SvIOK_on(newsv);
             }
             
             if (!aop->op_sibling)
@@ -182,6 +185,7 @@ om_entersub_method_named(pTHX) {
                 prev = aop;
             }
             
+            /* Change this into a SVOP holding a CV? */
             GV * last_gv    = CvGV(MUTABLE_CV(sv));
             OP * new_op     = newGVOP(OP_GV, 0, last_gv);
             new_op->op_next = entersubop;
@@ -200,7 +204,7 @@ om_entersub_method_named(pTHX) {
              */
             OP *weirdop = newOP(OP_NULL, 0);
             weirdop->op_targ = OP_CONST;
-            weirdop->op_next = newSVOP(OP_CONST, 0, classname_sv);
+            weirdop->op_next = newSVOP(OP_CONST, 0, newsv);
             weirdop->op_sibling = padsv->op_sibling;
             padsv->op_sibling = weirdop;
             OP_REFCNT_UNLOCK;
@@ -210,24 +214,68 @@ om_entersub_method_named(pTHX) {
             entersubop->op_spare = 1;
         }
         else {
-            if (!sv)
+            OP * aop = cUNOPx(entersubop)->op_first;
+            OP * saved_op = aop->op_sibling->op_sibling->op_next;
+            SV * saved_sv = cSVOPx_sv(saved_op);
+
+            if (!aop->op_sibling)
+                aop = cUNOPx(aop)->op_first;
+
+            if (!obj_sv || obj_sv == &PL_sv_undef)
                 return pessimize(entersubop);
-            SvGETMAGIC(sv);
-            if (!SvROK(sv)) {
-                /* XXX need to handle $x = "Foo"; $x->bar here */
+            SvGETMAGIC(obj_sv);
+
+            if (!SvROK(obj_sv)) {
+                /* my $x = "Foo"; $x->bar */
+                if (isGV_with_GP(obj_sv)) {
+                    /* Still don't care. */
+                    return pessimize(entersubop);
+                }
+                else {
+                    STRLEN len;
+                    STRLEN obj_class_len;
+                    const char *classname = SvPV_nomg_const(obj_sv, obj_class_len);
+                    const char *pv = SvPV_nomg_const(saved_sv, len);
+                    if (len != obj_class_len
+                        || memNE(pv, classname, len))
+                    {
+                        return pessimize(entersubop);
+                    }
+                    else {
+                        return default_entersub(aTHX);
+                    }
+                }
                 return pessimize(entersubop);
             }
-            ob = MUTABLE_SV(SvRV(sv));
+            else {
+            SV *ob = MUTABLE_SV(SvRV(obj_sv));
             
             if (!ob || !(SvOBJECT(ob))) {
                 return pessimize(entersubop);
             }
-            /*
-            type && strEQ(type,name)
-            if (!object_class_ok(ob, classname_op)) {
-                return pessimize(entersubop);
-            }*/
-                return pessimize(entersubop);
+        
+            HV *stash    = SvSTASH(ob);
+            HV *orig_stash = INT2PTR(HV*, SvIV(saved_sv));
+            /* This is not exactly safe, but chances of it
+             * going badly are miniscule
+             */
+            if (orig_stash != stash) {
+                /* Compare names. If they are the same, then
+                 * threads happened
+                 */
+                STRLEN len;
+                const char *classname = HvNAME(stash);
+                const char *pv = SvPV_nomg_const(saved_sv, len);
+                if (len == (STRLEN)HvNAMELEN(stash)
+                    && memEQ(pv, classname, len))
+                {
+                    SvIV_set(saved_sv, PTR2IV(stash));
+                }
+                else {
+                    return pessimize(entersubop);
+                }
+            }
+            }
         }
         return default_entersub(aTHX);
     }
@@ -236,8 +284,6 @@ om_entersub_method_named(pTHX) {
         return default_entersub(aTHX);
     }
 }
-
-
 
 STATIC void
 THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
