@@ -77,7 +77,6 @@ THX_method_named_find_stash(pTHX_ OP *classname_op, AV * const comppad_name, SV 
 
 static I32 total = 0;
 static I32 opt = 0;
-static I32 hard = 0;
 static I32 named = 0;
 static I32 op_method = 0;
 static I32 nostash = 0;
@@ -85,59 +84,130 @@ static I32 late = 0;
 
 static Perl_ppaddr_t default_entersub = NULL;
 
+/* XXX TODO Move this otuside of entersub and into OP_METHOD_NAMED */
+
+/* Undo the optimization
+ * A normal method call looks something like
+ *      entersub -> padsv -> 0 or more arguments -> method_named
+ * the optimized version looks like this, instead:
+ *      entersub -> padsv -> 0 or more arguments -> nullop -> gv -> const
+ *                                                     \ orig method_named
+ * where the gv op holds the gv for this optimization, and const
+ * is the magic scalar we use to check wether to pessimize
+ * What we want to do is make it look back like the original
+ */
 OP*
 THX_pessimize(pTHX_ OP* entersubop)
 #define pessimize(o)    THX_pessimize(aTHX_ o)
 {
     dVAR;
-    /* remove the CV from the stack */
-    PL_stack_sp--;
-
-    /* Undo the optimization */
     OP * aop = cUNOPx(entersubop)->op_first;
+    
+    /* remove the CV from the stack */
+    PL_stack_sp--; /* the cv */
     
     if (!aop->op_sibling)
         aop = cUNOPx(aop)->op_first;
         
-    OP *class = aop->op_sibling;
-    
-    OP *class_nullop = class->op_sibling;
-    class->op_sibling = class_nullop->op_next;
-    class->op_sibling->op_sibling = class_nullop->op_sibling;
-    op_free(class_nullop);
-
-    aop = class;
-    OP *prev  = class;
-
     /* We want the second to last sibling */
-    for (aop = aop->op_sibling; aop->op_sibling->op_sibling; aop = aop->op_sibling) {
-        prev = aop;
+    for (aop = aop->op_sibling; aop->op_sibling->op_sibling->op_sibling; aop = aop->op_sibling) {
     }
     
-    OP *nullop       = prev->op_sibling;
-    OP *method_named = nullop->op_next;
+    /* Undo the optimization */
+    OP *nullop       = aop;
     OP *opgv         = nullop->op_sibling;
+    OP *opconst      = opgv->op_sibling;
     
-    method_named->op_sibling = opgv->op_sibling;
-    method_named->op_next    = opgv->op_next;
+    /* We didn't call op_null() earlier on this so that
+     * op_targ would still point to the correct scalar, and
+     * so the scalar in the pad would not be freed.
+     */
+    nullop->op_type    = OP_METHOD_NAMED;
+    nullop->op_ppaddr  = PL_ppaddr[OP_METHOD_NAMED];
+    nullop->op_next    = opconst->op_next;
+    nullop->op_sibling = opconst->op_sibling;
     
+    op_free(opgv);
+    /* XXX Free from wrong pool when using threads! */
+    //op_free(opconst);
+   
     entersubop->op_spare  = 0;
-    prev->op_sibling = method_named;
     entersubop->op_ppaddr = default_entersub;
     
-    op_free(nullop);
-    /* XXX ...huh. Crashes Moose. Investigate? */
-    /*opgv->op_sibling = NULL;
-      opgv->op_next    = NULL;
-      op_free(opgv);*/
-
-    
-    PL_op = method_named;
+    PL_op = nullop;
 
     /* Now that we've pessimzied, call the method_named OP;
      * this in turn will call back the now normal entersub.
      */
     return PL_ppaddr[OP_METHOD_NAMED](aTHX);
+}
+
+OP *
+om_entersub_optimized(pTHX)
+{
+    dVAR;
+    OP * entersubop = PL_op;
+    SV * saved_sv   = *(PL_stack_sp--);
+    SV * obj_sv     = *(PL_stack_base + TOPMARK + 1);
+
+    if (!obj_sv || obj_sv == &PL_sv_undef)
+        return pessimize(entersubop);
+    
+    SvGETMAGIC(obj_sv);
+
+    if (!SvROK(obj_sv)) {
+        /* my $x = "Foo"; $x->bar */
+        if (isGV_with_GP(obj_sv)) {
+            /* Still don't care. */
+            return pessimize(entersubop);
+        }
+        else {
+            STRLEN len;
+            STRLEN obj_class_len;
+            const char *classname = SvPV_nomg_const(obj_sv, obj_class_len);
+            const char *pv = SvPV_nomg_const(saved_sv, len);
+            if (len != obj_class_len
+                || memNE(pv, classname, len))
+            {
+                return pessimize(entersubop);
+            }
+            else {
+                return default_entersub(aTHX);
+            }
+        }
+        return pessimize(entersubop);
+    }
+    else {
+        SV *ob = MUTABLE_SV(SvRV(obj_sv));
+        
+        if (!ob || !(SvOBJECT(ob))) {
+            return pessimize(entersubop);
+        }
+
+        HV *stash    = SvSTASH(ob);
+        HV *orig_stash = INT2PTR(HV*, SvIV(saved_sv));
+        /* This is not exactly safe, but chances of it
+            * going badly are miniscule
+            */
+        if (orig_stash != stash) {
+            /* Compare names. If they are the same, then
+                * threads happened
+                */
+            STRLEN len;
+            const char *classname = HvNAME(stash);
+            const char *pv = SvPV_nomg_const(saved_sv, len);
+            if (len == (STRLEN)HvNAMELEN(stash)
+                && memEQ(pv, classname, len))
+            {
+                SvIV_set(saved_sv, PTR2IV(stash));
+            }
+            else {
+                return pessimize(entersubop);
+            }
+        }
+    }
+
+    return default_entersub(aTHX);
 }
 
 OP *
@@ -148,135 +218,62 @@ om_entersub_method_named(pTHX) {
     {
         OP * entersubop = PL_op;
         SV * obj_sv = *(PL_stack_base + TOPMARK + 1);
-        if ( entersubop->op_spare == 0 ) {
-            SV *newsv;
-            OP * aop = cUNOPx(entersubop)->op_first;
 
-            SvGETMAGIC(obj_sv);
-            if (!SvROK(obj_sv)) {
-                if (isGV_with_GP(obj_sv)) {
-                    /* nope. Don't care. */
-                    PL_op->op_ppaddr = default_entersub;
-                    return default_entersub(aTHX);
-                }
-                /* $x = "Foo"; $x->bar */
-                newsv = newSVsv(obj_sv);
-                (void)SvUPGRADE(newsv, SVt_PVNV);
-                SvIV_set(newsv, 0);
-                SvIOK_on(newsv);
+        SV *newsv;
+        OP * aop = cUNOPx(entersubop)->op_first;
+        
+        SvGETMAGIC(obj_sv);
+        if (!SvROK(obj_sv)) {
+            if (isGV_with_GP(obj_sv)) {
+                /* nope. Don't care. */
+                PL_op->op_ppaddr = default_entersub;
+                return default_entersub(aTHX);
             }
-            else {
-                SV * ob    = SvRV(obj_sv);
-                HV * stash = SvSTASH(ob);
-                newsv = newSVhek(HvNAME_HEK(stash));
-                (void)SvUPGRADE(newsv, SVt_PVNV);
-                SvIV_set(newsv, PTR2IV(stash));
-                SvIOK_on(newsv);
-            }
-            
-            if (!aop->op_sibling)
-                aop = cUNOPx(aop)->op_first;
-
-            OP *padsv = aop->op_sibling;
-            OP *prev = aop;
-            
-            /* We want the last sibling */
-            for (aop = aop->op_sibling; aop->op_sibling; aop = aop->op_sibling) {
-                prev = aop;
-            }
-            
-            /* Change this into a SVOP holding a CV? */
-            GV * last_gv    = CvGV(MUTABLE_CV(sv));
-            OP * new_op     = newGVOP(OP_GV, 0, last_gv);
-            new_op->op_next = entersubop;
-            new_op->op_sibling = aop->op_sibling;
-            OP * nullop = newOP(OP_NULL, 0);
-            nullop->op_targ = OP_METHOD_NAMED;
-            
-            nullop->op_sibling = new_op;
-            nullop->op_next    = aop;
-
-            OP_REFCNT_LOCK;
-            prev->op_sibling = nullop;
-
-            /* Probably horrible and broken! Maybe try typing the padsv to
-             * classname_sv?
-             */
-            OP *weirdop = newOP(OP_NULL, 0);
-            weirdop->op_targ = OP_CONST;
-            weirdop->op_next = newSVOP(OP_CONST, 0, newsv);
-            weirdop->op_sibling = padsv->op_sibling;
-            padsv->op_sibling = weirdop;
-            OP_REFCNT_UNLOCK;
-            
-            opt++;
-            
-            entersubop->op_spare = 1;
+            /* $x = "Foo"; $x->bar */
+            newsv = newSVsv(obj_sv);
+            (void)SvUPGRADE(newsv, SVt_PVNV);
+            SvIV_set(newsv, 0);
+            SvIOK_on(newsv);
         }
         else {
-            OP * aop = cUNOPx(entersubop)->op_first;
-            OP * saved_op = aop->op_sibling->op_sibling->op_next;
-            SV * saved_sv = cSVOPx_sv(saved_op);
-
-            if (!aop->op_sibling)
-                aop = cUNOPx(aop)->op_first;
-
-            if (!obj_sv || obj_sv == &PL_sv_undef)
-                return pessimize(entersubop);
-            SvGETMAGIC(obj_sv);
-
-            if (!SvROK(obj_sv)) {
-                /* my $x = "Foo"; $x->bar */
-                if (isGV_with_GP(obj_sv)) {
-                    /* Still don't care. */
-                    return pessimize(entersubop);
-                }
-                else {
-                    STRLEN len;
-                    STRLEN obj_class_len;
-                    const char *classname = SvPV_nomg_const(obj_sv, obj_class_len);
-                    const char *pv = SvPV_nomg_const(saved_sv, len);
-                    if (len != obj_class_len
-                        || memNE(pv, classname, len))
-                    {
-                        return pessimize(entersubop);
-                    }
-                    else {
-                        return default_entersub(aTHX);
-                    }
-                }
-                return pessimize(entersubop);
-            }
-            else {
-            SV *ob = MUTABLE_SV(SvRV(obj_sv));
-            
-            if (!ob || !(SvOBJECT(ob))) {
-                return pessimize(entersubop);
-            }
-        
-            HV *stash    = SvSTASH(ob);
-            HV *orig_stash = INT2PTR(HV*, SvIV(saved_sv));
-            /* This is not exactly safe, but chances of it
-             * going badly are miniscule
-             */
-            if (orig_stash != stash) {
-                /* Compare names. If they are the same, then
-                 * threads happened
-                 */
-                STRLEN len;
-                const char *classname = HvNAME(stash);
-                const char *pv = SvPV_nomg_const(saved_sv, len);
-                if (len == (STRLEN)HvNAMELEN(stash)
-                    && memEQ(pv, classname, len))
-                {
-                    SvIV_set(saved_sv, PTR2IV(stash));
-                }
-                else {
-                    return pessimize(entersubop);
-                }
-            }
-            }
+            SV * ob    = SvRV(obj_sv);
+            HV * stash = SvSTASH(ob);
+            newsv = newSVhek(HvNAME_HEK(stash));
+            (void)SvUPGRADE(newsv, SVt_PVNV);
+            SvIV_set(newsv, PTR2IV(stash));
+            SvIOK_on(newsv);
         }
+        
+        if (!aop->op_sibling)
+            aop = cUNOPx(aop)->op_first;
+
+        /* We want the last sibling */
+        for (aop = aop->op_sibling; aop->op_sibling; aop = aop->op_sibling) {
+        }
+
+        OP *opconst     = newSVOP(OP_CONST, 0, newsv);
+        
+        /* Change this into a SVOP holding a CV? */
+        SV * cv     = SvREFCNT_inc_simple_NN(MUTABLE_CV(sv));
+        OP * new_op = newSVOP(OP_CONST, 0, cv);
+        
+        opconst->op_next = entersubop;
+        opconst->op_sibling = aop->op_sibling;
+        
+        new_op->op_sibling = opconst;
+        new_op->op_next    = opconst;
+
+        /* Fake an op_null(), we still want the original op_targ */
+        aop->op_next = new_op;
+        aop->op_sibling = new_op;
+        aop->op_type   = OP_NULL;
+        aop->op_ppaddr = PL_ppaddr[OP_NULL];
+
+        entersubop->op_ppaddr = om_entersub_optimized;
+        entersubop->op_spare  = 1;
+        
+        opt++;
+        
         return default_entersub(aTHX);
     }
     else {
@@ -292,7 +289,16 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
     OP * aop = cUNOPx(entersubop)->op_first;
     HV * stash;
     SV * class_sv;
+    const bool hasargs = (entersubop->op_flags & OPf_STACKED) != 0;
 
+    /* hasargs is really wether a subroutine is being called
+     * ala &foo, which is never true with methods. So bail out
+     * of this one quickly.
+     */
+    if (!hasargs) {
+        return;
+    }
+    
     if (!aop->op_sibling)
        aop = cUNOPx(aop)->op_first;
 
@@ -318,12 +324,6 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
     
     named++;
 
-    /* Either sub {}->Foo or Foo->bar->doof */
-    if ( classname_op->op_type == OP_ENTERSUB ) {
-        hard++;
-        return;
-    }
-    
     if ( (stash = method_named_find_stash(classname_op, comppad_name, &class_sv)) ) {
         dMY_CXT;
         HV *finalized = MY_CXT.finalized;
@@ -387,6 +387,17 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
         else {
             late++;
             /* Late binding */
+            if ( gv && MUTABLE_SV(gv) == &PL_sv_yes ) {
+                /* ->import and ->unimport, don't care */;
+            }
+            else {
+                /* Try the runtime optimization, but is it worth it?
+                 * This is around 2% of all method calls
+                 */
+                entersubop->op_ppaddr = om_entersub_method_named;            
+            }
+
+            /*
             if (gv && MUTABLE_SV(gv) != &PL_sv_yes && !cv) {
                 //PerlIO_printf(Perl_debug_log, "\nShould never happen: %"SVf"->%"SVf"\n", newSVhek(HvNAME_HEK(stash)), method);
             }
@@ -394,30 +405,21 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
                 
                 //PerlIO_printf(Perl_debug_log, "WOah: %"SVf"->%"SVf"\n", newSVhek(HvNAME_HEK(stash)), method);
             }
-            else {
-                /* ->import ->unimport, don't care */;
-            }
+            */
         }
         }
     }
     else {
         nostash++;
-        if ( classname_op->op_type == OP_CONST ) {
-            /* require Foo; Foo->bar */
-            //sv_dump(cSVOPx_sv(classname_op));
-        }
-        else if ( classname_op->op_type == OP_PADSV ) {
-            /* Experiment time!
-             * Try changing $foo->bar() into
-             * Class::bar($foo) at runtime, and pessimize if
-             * $foo is ever != Class
-             */
-            entersubop->op_ppaddr = om_entersub_method_named;
-        }
-        else {
-            /* bless(...)->Foo, etc */
-            hard++;
-        }
+        /* Experiment time!
+            * Try changing $foo->bar() into
+            * Class::bar($foo) at runtime, and pessimize if
+            * $foo is ever of a different class.
+            * This also grabs several "hard" cases, like
+            * bless(..)->foo, sub {...}->foo, $x[0]->foo,
+            * $x{foo}->foo, etc
+         */
+        entersubop->op_ppaddr = om_entersub_method_named;
     }
 }
 
@@ -652,7 +654,7 @@ unfinalize_class(SV *classname)
 CODE:
     dMY_CXT;
     (void) hv_delete_ent(MY_CXT.finalized, classname, G_DISCARD, 0);
-    PerlIO_printf(Perl_debug_log, "total: %d, named_method: %d, hard: %d, optimized: %d, op_method: %d, no stash: %d, late: %d\n", total, named, hard, opt, op_method, nostash, late);
+    PerlIO_printf(Perl_debug_log, "total: %d, named_method: %d, optimized: %d, op_method: %d, no stash: %d, late: %d\n", total, named, opt, op_method, nostash, late);
 
 void
 exclude_class(SV *classname)
