@@ -503,6 +503,33 @@ myck_sassign(pTHX_ OP *o)
             typefy_pad_entries(first);
             break;
         }
+        case OP_BLESS: {
+            /* Typefy $x = bless {}, "Foo" */
+            HV *stash;
+            OP *target = first->op_sibling;
+
+            if ( !target || target->op_type != OP_PADSV ) {
+                break;
+            }
+            
+            OP *classname_op = cLISTOPx(first)->op_last;
+            
+            /* bless {}; */
+            if ( cLISTOPx(first)->op_first->op_sibling == classname_op ) {
+                stash = PL_curstash;
+            }
+            /* bless {}, "Foo"; */
+            else if ( classname_op->op_type == OP_CONST ) {
+                SV *class = cSVOPx_sv(classname_op);
+                stash     = gv_stashsv(class, 0);
+                
+            }
+            
+            if (stash) {
+                padop_assign_type(target, stash);
+            }
+            break;
+        }
         case OP_PADSV: {
             /* Turn
              * my $y = $x;
