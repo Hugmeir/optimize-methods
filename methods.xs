@@ -75,13 +75,6 @@ THX_method_named_find_stash(pTHX_ OP *classname_op, AV * const comppad_name, SV 
     }
 }
 
-static I32 total = 0;
-static I32 opt = 0;
-static I32 named = 0;
-static I32 op_method = 0;
-static I32 nostash = 0;
-static I32 late = 0;
-
 static Perl_ppaddr_t default_entersub = NULL;
 
 /* XXX TODO Move this otuside of entersub and into OP_METHOD_NAMED */
@@ -272,8 +265,6 @@ om_entersub_method_named(pTHX) {
         entersubop->op_ppaddr = om_entersub_optimized;
         entersubop->op_spare  = 1;
         
-        opt++;
-        
         return default_entersub(aTHX);
     }
     else {
@@ -304,8 +295,6 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
 
     OP *classname_op = aop->op_sibling;
 
-    total++;
-    
     /* This sub has no arguments, ergo no classname/object -- so it's not
      * a method call */
     if ( !classname_op )
@@ -317,13 +306,9 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
 
     /* If the last sibling isn't a method_named op, then return */
     if ( aop->op_type != OP_METHOD_NAMED ) {
-        if (aop->op_type == OP_METHOD)
-            op_method++;
         return;
     }
     
-    named++;
-
     if ( (stash = method_named_find_stash(classname_op, comppad_name, &class_sv)) ) {
         dMY_CXT;
         HV *finalized = MY_CXT.finalized;
@@ -381,11 +366,11 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
             /* Finally, since the classname is now an argument, it's subject
              * to strict checking, so turn it off for this bareword
              */
-            classname_op->op_private &= ~(OPpCONST_BARE|OPpCONST_STRICT);
-            opt++;
+            if ( classname_op->op_type == OP_CONST ) {
+                classname_op->op_private &= ~(OPpCONST_BARE|OPpCONST_STRICT);
+            }
         }
         else {
-            late++;
             /* Late binding */
             if ( gv && MUTABLE_SV(gv) == &PL_sv_yes ) {
                 /* ->import and ->unimport, don't care */;
@@ -410,7 +395,6 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
         }
     }
     else {
-        nostash++;
         /* Experiment time!
             * Try changing $foo->bar() into
             * Class::bar($foo) at runtime, and pessimize if
@@ -654,7 +638,7 @@ unfinalize_class(SV *classname)
 CODE:
     dMY_CXT;
     (void) hv_delete_ent(MY_CXT.finalized, classname, G_DISCARD, 0);
-    PerlIO_printf(Perl_debug_log, "total: %d, named_method: %d, optimized: %d, op_method: %d, no stash: %d, late: %d\n", total, named, opt, op_method, nostash, late);
+
 
 void
 exclude_class(SV *classname)
