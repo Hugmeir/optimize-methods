@@ -34,6 +34,8 @@ sub import {
     
     optimize_methods($caller);
     
+    $self->start();
+
     unshift @_, $self;
     goto &{$self->can("SUPER::import")};
 }
@@ -41,6 +43,7 @@ sub import {
 sub unimport {
     my $self   = shift;
     my $caller = shift || caller;
+    $self->done();
     unfinalize_class($caller);
 }
 

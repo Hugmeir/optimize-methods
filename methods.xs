@@ -75,17 +75,16 @@ THX_method_named_find_stash(pTHX_ OP *classname_op, AV * const comppad_name, SV 
     }
 }
 
+static Perl_ppaddr_t default_method_named = NULL;
 static Perl_ppaddr_t default_entersub = NULL;
-
-/* XXX TODO Move this otuside of entersub and into OP_METHOD_NAMED */
 
 /* Undo the optimization
  * A normal method call looks something like
  *      entersub -> padsv -> 0 or more arguments -> method_named
  * the optimized version looks like this, instead:
- *      entersub -> padsv -> 0 or more arguments -> nullop -> gv -> const
- *                                                     \ orig method_named
- * where the gv op holds the gv for this optimization, and const
+ *      entersubfast -> padsv -> 0 or more arguments -> method_named_fast -> constcv
+ *                                                       \ constsv
+ * where the constcv holds the cv for this optimization, and constsv
  * is the magic scalar we use to check wether to pessimize
  * What we want to do is make it look back like the original
  */
@@ -96,38 +95,39 @@ THX_pessimize(pTHX_ OP* entersubop)
     dVAR;
     OP * aop = cUNOPx(entersubop)->op_first;
     
-    /* remove the CV from the stack */
-    PL_stack_sp--; /* the cv */
-    
     if (!aop->op_sibling)
         aop = cUNOPx(aop)->op_first;
         
     /* We want the second to last sibling */
-    for (aop = aop->op_sibling; aop->op_sibling->op_sibling->op_sibling; aop = aop->op_sibling) {
+    for (aop = aop->op_sibling; aop->op_sibling->op_sibling; aop = aop->op_sibling) {
     }
     
     /* Undo the optimization */
-    OP *nullop       = aop;
-    OP *opgv         = nullop->op_sibling;
-    OP *opconst      = opgv->op_sibling;
+    OP *method_named = aop;
+    OP *opcv         = method_named->op_sibling;
+    OP *opconst      = method_named->op_next;
+    
+    opconst->op_next = NULL;
     
     /* We didn't call op_null() earlier on this so that
      * op_targ would still point to the correct scalar, and
      * so the scalar in the pad would not be freed.
      */
-    nullop->op_type    = OP_METHOD_NAMED;
-    nullop->op_ppaddr  = PL_ppaddr[OP_METHOD_NAMED];
-    nullop->op_next    = opconst->op_next;
-    nullop->op_sibling = opconst->op_sibling;
+    method_named->op_type    = OP_METHOD_NAMED;
+    method_named->op_ppaddr  = PL_ppaddr[OP_METHOD_NAMED];
+    method_named->op_next    = opcv->op_next;
+    method_named->op_sibling = opcv->op_sibling;
     
-    op_free(opgv);
-    /* XXX Free from wrong pool when using threads! */
-    //op_free(opconst);
+    opcv->op_next = NULL;
+    opcv->op_sibling = NULL;
+    
+    op_free(opcv);
+    op_free(opconst);
    
     entersubop->op_spare  = 0;
     entersubop->op_ppaddr = default_entersub;
     
-    PL_op = nullop;
+    PL_op = method_named;
 
     /* Now that we've pessimzied, call the method_named OP;
      * this in turn will call back the now normal entersub.
@@ -135,12 +135,147 @@ THX_pessimize(pTHX_ OP* entersubop)
     return PL_ppaddr[OP_METHOD_NAMED](aTHX);
 }
 
-OP *
-om_entersub_optimized(pTHX)
+
+#define ENTERSUB_COMMON_DECLARATIONS   \
+    dVAR; dSP; dPOPss;          \
+    PERL_CONTEXT *cx;           \
+    I32 gimme                   \
+
+#define ENTERSUB_COMMON_END STMT_START {                        \
+    SAVETMPS;                                                   \
+    if ((cx->blk_u16 & OPpENTERSUB_LVAL_MASK) == OPpLVAL_INTRO) \
+        DIE(aTHX_ "Can't modify non-lvalue subroutine call");   \
+    RETURNOP(CvSTART(cv));                                      \
+} STMT_END
+
+#define ENTERSUB_COMMON_BODY \
+    PADLIST * const padlist = CvPADLIST(cv); \
+    PUSHBLOCK(cx, CXt_SUB, MARK); \
+    PUSHSUB(cx); \
+    cx->blk_sub.retop = PL_op->op_next; \
+    CvDEPTH(cv)++; \
+    if (CvDEPTH(cv) >= 2) { \
+        PERL_STACK_OVERFLOW_CHECK(); \
+        Perl_pad_push(aTHX_ padlist, CvDEPTH(cv)); \
+    } \
+    SAVECOMPPAD(); \
+    PAD_SET_CUR_NOSAVE(padlist, CvDEPTH(cv))
+
+#define ENTERSUB_COMMON_ARGS    STMT_START {                    \
+    SSize_t items = SP - MARK;                                  \
+    AV *const av = MUTABLE_AV(PAD_SVl(0));                      \
+    if (AvREAL(av)) {                                           \
+        /* @_ is normally not REAL--this should only ever       \
+         * happen when DB::sub() calls things that modify @_ */ \
+        av_clear(av);                                           \
+        AvREAL_off(av);                                         \
+        AvREIFY_on(av);                                         \
+    }                                                           \
+    cx->blk_sub.savearray = GvAV(PL_defgv);                     \
+    GvAV(PL_defgv) = MUTABLE_AV(SvREFCNT_inc_simple(av));       \
+    CX_CURPAD_SAVE(cx->blk_sub);                                \
+    cx->blk_sub.argarray = av;                                  \
+    ++MARK;                                                     \
+                                                                \
+    if (items - 1 > AvMAX(av)) {                                \
+        SV **ary = AvALLOC(av);                                 \
+        AvMAX(av) = items - 1;                                  \
+        Renew(ary, items, SV*);                                 \
+        AvALLOC(av) = ary;                                      \
+        AvARRAY(av) = ary;                                      \
+    }                                                           \
+                                                                \
+    Copy(MARK,AvARRAY(av),items,SV*);                           \
+    AvFILLp(av) = items - 1;                                    \
+                                                                \
+    MARK = AvARRAY(av);                                         \
+    while (items--) {                                           \
+        if (*MARK) {                                            \
+            if (SvPADTMP(*MARK) && !IS_PADGV(*MARK)) {          \
+                *MARK = sv_mortalcopy(*MARK);                   \
+            }                                                   \
+            SvTEMP_off(*MARK);                                  \
+        }                                                       \
+        MARK++;                                                 \
+    }                                                           \
+} STMT_END
+
+#define ENTERSUB_XS_ARGS STMT_START {   \
+    SSize_t markix = TOPMARK;           \
+    SAVETMPS;                           \
+    PUTBACK;                            \
+    if (((PL_op->op_private                                     \
+           & PUSHSUB_GET_LVALUE_MASK(Perl_is_lvalue_sub)        \
+             ) & OPpENTERSUB_LVAL_MASK) == OPpLVAL_INTRO &&     \
+        !CvLVALUE(cv))                                          \
+        DIE(aTHX_ "Can't modify non-lvalue subroutine call");   \
+    SV **mark = PL_stack_base + markix; \
+    SSize_t items = SP - mark;          \
+    while (items--) {                   \
+        mark++;                         \
+        if (*mark && SvPADTMP(*mark) && !IS_PADGV(*mark)) { \
+            *mark = sv_mortalcopy(*mark);                   \
+        }                               \
+    }                                   \
+    assert(CvXSUB(cv));                 \
+    CvXSUB(cv)(aTHX_ cv);               \
+    if (gimme == G_SCALAR && ++markix != PL_stack_sp - PL_stack_base ) {    \
+        if (markix > PL_stack_sp - PL_stack_base)                           \
+        *(PL_stack_base + markix) = &PL_sv_undef;                           \
+        else                                                                \
+        *(PL_stack_base + markix) = *PL_stack_sp;                           \
+        PL_stack_sp = PL_stack_base + markix;                               \
+    }                                                                       \
+    LEAVE;                              \
+    return NORMAL;                      \
+} STMT_END
+
+/* foo() */
+STATIC OP*
+S_pp_entersubcv_args(pTHX)
 {
-    dVAR;
-    OP * entersubop = PL_op;
-    SV * saved_sv   = *(PL_stack_sp--);
+    ENTERSUB_COMMON_DECLARATIONS;
+    CV *cv = MUTABLE_CV(sv);
+    const bool hasargs = TRUE;
+
+    ENTER;
+
+    gimme = GIMME_V;
+
+    dMARK;
+
+    ENTERSUB_COMMON_BODY;
+
+    /* Handle arguments */
+    ENTERSUB_COMMON_ARGS;
+
+    ENTERSUB_COMMON_END;
+}
+
+
+/* foo() */
+STATIC OP*
+S_pp_entersubcvxs_args(pTHX)
+{
+    ENTERSUB_COMMON_DECLARATIONS;
+    CV *cv = MUTABLE_CV(sv);
+    const bool hasargs = TRUE;
+
+    ENTER;
+
+    gimme = GIMME_V;
+
+    /* Handle arguments */
+    ENTERSUB_XS_ARGS;
+}
+
+OP *
+om_method_named_fast(pTHX)
+{
+    dVAR; dSP;
+    OP * constcv    = PL_op->op_sibling;
+    OP * entersubop = PL_op->op_next->op_next;
+    SV * saved_sv   = cSVOPx_sv(PL_op->op_next);
     SV * obj_sv     = *(PL_stack_base + TOPMARK + 1);
 
     if (!obj_sv || obj_sv == &PL_sv_undef)
@@ -164,11 +299,7 @@ om_entersub_optimized(pTHX)
             {
                 return pessimize(entersubop);
             }
-            else {
-                return default_entersub(aTHX);
-            }
         }
-        return pessimize(entersubop);
     }
     else {
         SV *ob = MUTABLE_SV(SvRV(obj_sv));
@@ -177,7 +308,7 @@ om_entersub_optimized(pTHX)
             return pessimize(entersubop);
         }
 
-        HV *stash    = SvSTASH(ob);
+        HV *stash      = SvSTASH(ob);
         HV *orig_stash = INT2PTR(HV*, SvIV(saved_sv));
         /* This is not exactly safe, but chances of it
             * going badly are miniscule
@@ -200,76 +331,83 @@ om_entersub_optimized(pTHX)
         }
     }
 
-    return default_entersub(aTHX);
+    XPUSHs(cSVOPx_sv(constcv));
+    PUTBACK;
+
+    return entersubop;
 }
 
 OP *
-om_entersub_method_named(pTHX) {
-    dVAR; dSP; dTOPss;
+om_method_named(pTHX) {
+    dVAR;
 
-    if (sv && (SvTYPE(sv) == SVt_PVCV) && !CvANON(sv))
+    /* We need to call the default method_named first! */
+
+    OP *entersubop = default_method_named(aTHX);
+    SV *sv = *PL_stack_sp;
+
+    if (sv && (SvTYPE(sv) == SVt_PVCV) && !CvLVALUE(sv))
     {
-        OP * entersubop = PL_op;
-        SV * obj_sv = *(PL_stack_base + TOPMARK + 1);
-
-        SV *newsv;
-        OP * aop = cUNOPx(entersubop)->op_first;
+        OP * method_named = PL_op;
+        SV * obj_sv       = *(PL_stack_base + TOPMARK + 1);
+        SV * newsv;
         
         SvGETMAGIC(obj_sv);
         if (!SvROK(obj_sv)) {
             if (isGV_with_GP(obj_sv)) {
-                /* nope. Don't care. */
-                PL_op->op_ppaddr = default_entersub;
-                return default_entersub(aTHX);
+                /* *foo->bar */
+                HV * stash = GvSTASH(obj_sv);
+                newsv = newSVhek(HvNAME_HEK(stash));
+                (void)SvUPGRADE(newsv, SVt_PVNV);
+                SvIV_set(newsv, PTR2IV(stash));
+                SvIOK_on(newsv);
             }
-            /* $x = "Foo"; $x->bar */
-            newsv = newSVsv(obj_sv);
-            (void)SvUPGRADE(newsv, SVt_PVNV);
-            SvIV_set(newsv, 0);
-            SvIOK_on(newsv);
+            else {
+                /* $x = "Foo"; $x->bar */
+                newsv = newSVsv(obj_sv);
+                (void)SvUPGRADE(newsv, SVt_PVNV);
+                SvIV_set(newsv, 0);
+                SvIOK_on(newsv);
+            }
         }
         else {
+            /* Either a blessed object or a reference to a glob */
             SV * ob    = SvRV(obj_sv);
-            HV * stash = SvSTASH(ob);
+            HV * stash = SvOBJECT(ob) ? SvSTASH(ob) : GvSTASH(ob);
             newsv = newSVhek(HvNAME_HEK(stash));
             (void)SvUPGRADE(newsv, SVt_PVNV);
             SvIV_set(newsv, PTR2IV(stash));
             SvIOK_on(newsv);
         }
         
-        if (!aop->op_sibling)
-            aop = cUNOPx(aop)->op_first;
-
-        /* We want the last sibling */
-        for (aop = aop->op_sibling; aop->op_sibling; aop = aop->op_sibling) {
-        }
-
-        OP *opconst     = newSVOP(OP_CONST, 0, newsv);
-        
-        /* Change this into a SVOP holding a CV? */
-        SV * cv     = SvREFCNT_inc_simple_NN(MUTABLE_CV(sv));
-        OP * new_op = newSVOP(OP_CONST, 0, cv);
+        /* What we have:
+         *  entersub -> padsv -> ... -> method_named ->> entersubfast
+         * we want:
+         *  entersubfast -> padsv -> ... -> method_named_fast -> cv ->> entersubfast
+         *                                      \->> op_const
+         */
+        OP * opconst = newSVOP(OP_CONST, 0, newsv);
+        SV * cv      = SvREFCNT_inc_simple_NN(MUTABLE_CV(sv));
+        OP * new_op  = newSVOP(OP_CONST, 0, cv);
         
         opconst->op_next = entersubop;
-        opconst->op_sibling = aop->op_sibling;
         
-        new_op->op_sibling = opconst;
-        new_op->op_next    = opconst;
+        new_op->op_sibling = method_named->op_sibling;
+        new_op->op_next    = method_named->op_next;
 
-        /* Fake an op_null(), we still want the original op_targ */
-        aop->op_next = new_op;
-        aop->op_sibling = new_op;
-        aop->op_type   = OP_NULL;
-        aop->op_ppaddr = PL_ppaddr[OP_NULL];
+        /* Do NOT touch op_targ! */
+        method_named->op_next    = opconst;
+        method_named->op_ppaddr  = om_method_named_fast;
+        method_named->op_sibling = new_op;
 
-        entersubop->op_ppaddr = om_entersub_optimized;
-        entersubop->op_spare  = 1;
-        
-        return default_entersub(aTHX);
+        entersubop->op_ppaddr = CvISXSUB(cv)
+                              ? S_pp_entersubcvxs_args
+                              : S_pp_entersubcv_args;
+        return entersubop;
     }
     else {
-        PL_op->op_ppaddr = default_entersub;
-        return default_entersub(aTHX);
+        PL_op->op_ppaddr = PL_ppaddr[OP_METHOD_NAMED];
+        return entersubop;
     }
 }
 
@@ -327,7 +465,6 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
         if ( hv_fetch_ent(exclude, class_sv, 0, 0) ) {
             return;
         }
-        
 
         {
         CV *cv;
@@ -379,7 +516,7 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
                 /* Try the runtime optimization, but is it worth it?
                  * This is around 2% of all method calls
                  */
-                entersubop->op_ppaddr = om_entersub_method_named;            
+                aop->op_ppaddr = om_method_named;            
             }
 
             /*
@@ -403,7 +540,7 @@ THX_optimize_named_method(pTHX_ OP *entersubop, AV * const comppad_name)
             * bless(..)->foo, sub {...}->foo, $x[0]->foo,
             * $x{foo}->foo, etc
          */
-        entersubop->op_ppaddr = om_entersub_method_named;
+        aop->op_ppaddr = om_method_named;
     }
 }
 
@@ -412,7 +549,15 @@ STATIC void
 THX_padop_assign_type(pTHX_ OP* padsv, HV* stash)
 #define padop_assign_type(padsv, stash) THX_padop_assign_type(aTHX_ padsv, stash)
 {
-    SV **svp = av_fetch(PL_comppad_name, padsv->op_targ, FALSE);
+    SV **svp;
+    
+    if ( !PL_comppad_name || !SvOK(PL_comppad_name) ) {
+       /* Global destruction */
+        return;
+    }
+
+    svp = av_fetch(PL_comppad_name, padsv->op_targ, FALSE);
+
     if (!svp || !*svp)
         return;
     SV *assign_sv = *svp;
@@ -618,12 +763,11 @@ BOOT:
     MY_CXT.exclude   = newHV();
     
     nxck_sassign          = PL_check[OP_SASSIGN];
-    PL_check[OP_SASSIGN]  = myck_sassign;
     
     nxck_entersubop       = PL_check[OP_ENTERSUB];
-    PL_check[OP_ENTERSUB] = myck_entersubop;
     
     default_entersub      = PL_ppaddr[OP_ENTERSUB];
+    default_method_named  = PL_ppaddr[OP_METHOD_NAMED];
 }
 
 #ifdef USE_ITHREADS
@@ -665,6 +809,18 @@ unfinalize_class(SV *classname)
 CODE:
     dMY_CXT;
     (void) hv_delete_ent(MY_CXT.finalized, classname, G_DISCARD, 0);
+
+void
+start(SV *classname)
+CODE:
+    PL_check[OP_SASSIGN]  = myck_sassign;
+    PL_check[OP_ENTERSUB] = myck_entersubop;
+
+void
+done(SV *classname)
+CODE:
+    PL_check[OP_SASSIGN]  = nxck_sassign;
+    PL_check[OP_ENTERSUB] = nxck_entersubop;
 
 
 void
